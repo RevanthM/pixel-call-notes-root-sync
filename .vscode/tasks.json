@@ -1,0 +1,17 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Call Notes: test",
+      "type": "shell",
+      "command": "python3 -m unittest discover -s sync -p 'test_*.py' -v && python3 -m unittest discover -s aws/tests -p 'test_*.py' -v && python3 -m unittest discover -s tests -p 'test_*.py' -v",
+      "problemMatcher": []
+    },
+    {
+      "label": "Call Notes: public safety scan",
+      "type": "shell",
+      "command": "python3 scripts/public_safety_check.py --root . && gitleaks dir . --redact --no-banner",
+      "problemMatcher": []
+    }
+  ]
+}

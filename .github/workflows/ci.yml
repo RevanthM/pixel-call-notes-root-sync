@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+          cache: pip
+      - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
+      - run: pip install -r requirements-dev.txt
+      - run: python -m unittest discover -s sync -p 'test_*.py' -v
+      - run: python -m unittest discover -s aws/tests -p 'test_*.py' -v
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - run: python -m py_compile sync/*.py aws/functions/*/app.py scripts/*.py
+      - run: bash -n scripts/*.sh
+      - run: shellcheck scripts/*.sh
+      - run: cfn-lint aws/template.yaml aws/bucket-template.yaml
+      - run: sam validate --lint --template-file aws/template.yaml
+      - run: sam build --template-file aws/template.yaml
+      - run: pip-audit -r requirements.txt
+      - run: pip-audit -r requirements-dev.txt
+      - run: bandit -q -r sync scripts aws/functions -x '*/test_*.py' -ll
+      - run: python scripts/public_safety_check.py --root .
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,26 @@
+---
+description: Safety and privacy rules for rooted Pixel and AWS work
+alwaysApply: true
+---
+
+# Rooted Pixel safety
+
+- Read `AGENTS.md` before acting.
+- Never unlock, wipe, flash, relock, or install a root module without explicit
+  approval for that exact action.
+- Verify codename, build, slot, image hash, and stock recovery before flashing.
+- Use only upstream artifacts; never commit or redistribute binaries.
+- Configure PCS only from a reviewed immutable manifest commit.
+
+# Privacy and AWS
+
+- Never commit call content, contacts, phone numbers, serials, databases,
+  protobufs, screenshots, bucket names, account IDs, or credentials.
+- Keep metadata redacted unless the user explicitly opts in.
+- Stop if the AWS caller ARN ends with `:root`.
+- Never expose the bucket publicly or log prompts/transcripts.
+
+# Verification
+
+Run unit tests, Python compilation, `cfn-lint`, `bash -n`, and
+`scripts/public_safety_check.py --root .` before committing.

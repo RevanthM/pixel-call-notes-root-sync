@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Private retained storage for rooted Pixel Call Notes
+
+Parameters:
+  BucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Globally unique private S3 bucket name
+  ProtectSourceObjects:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Deny deletion of canonical, ready, metadata, and staged source objects
+
+Conditions:
+  ProtectSources: !Equals [!Ref ProtectSourceObjects, "true"]
+
+Resources:
+  AudioBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      Tags:
+        - Key: ManagedBy
+          Value: pixel-call-notes-root-sync
+        - Key: DataClass
+          Value: PrivateCallContent
+
+  AudioBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref AudioBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AudioBucket.Arn
+              - !Sub "${AudioBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: RequireCreateOnlyProtectedWrites
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/audio.m4a"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/source/metadata.json"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/ready.json"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/input/*"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/terminal.json"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/jobs/*"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/asr/v1/jobs/*/transcript.*"
+              - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/llm/v1/jobs/*"
+            Condition:
+              StringNotEquals:
+                s3:if-none-match: "*"
+          - !If
+            - ProtectSources
+            - Sid: DenyProtectedSourceDeletion
+              Effect: Deny
+              Principal: "*"
+              Action:
+                - s3:DeleteObject
+                - s3:DeleteObjectVersion
+              Resource:
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/audio.m4a"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/source/metadata.json"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/ready.json"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/input/*"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/terminal.json"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/pipeline/v1/jobs/*"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/asr/v1/jobs/*/transcript.*"
+                - !Sub "${AudioBucket.Arn}/call-notes/dt=*/*/llm/v1/jobs/*"
+            - !Ref AWS::NoValue
+
+Outputs:
+  BucketName:
+    Value: !Ref AudioBucket
+  BucketArn:
+    Value: !GetAtt AudioBucket.Arn

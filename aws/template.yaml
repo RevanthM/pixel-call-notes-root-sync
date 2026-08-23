@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Durable private Call Notes transcription and summarization pipeline
+
+Parameters:
+  AudioBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  LanguageCode:
+    Type: String
+    Default: en-US
+  SummaryModelId:
+    Type: String
+    Default: us.amazon.nova-lite-v1:0
+    AllowedValues: [us.amazon.nova-lite-v1:0]
+    Description: US geographic Bedrock inference profile used by Converse
+
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic ARN for DLQ alarm notifications
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [arm64]
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+    Environment:
+      Variables:
+        AUDIO_BUCKET: !Ref AudioBucketName
+
+Resources:
+  AudioDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AudioQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AudioDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  CompletionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  CompletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CompletionDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  EventDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  AudioCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route canonical Call Notes audio to the durable starter queue
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref AudioBucketName]
+          object:
+            key:
+              - wildcard: call-notes/dt=*/*/ready.json
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AudioQueue.Arn
+          Id: AudioQueue
+          DeadLetterConfig:
+            Arn: !GetAtt EventDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 185
+
+  TranscribeCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route Call Notes Transcribe terminal events to finalization
+      EventPattern:
+        source: [aws.transcribe]
+        detail-type: [Transcribe Job State Change]
+        detail:
+          TranscriptionJobName:
+            - prefix: callnotes-
+          TranscriptionJobStatus:
+            - COMPLETED
+            - FAILED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CompletionQueue.Arn
+          Id: CompletionQueue
+          DeadLetterConfig:
+            Arn: !GetAtt EventDeadLetterQueue.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 86400
+            MaximumRetryAttempts: 185
+
+  EventQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AudioQueue
+        - !Ref CompletionQueue
+        - !Ref EventDeadLetterQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EventBridgeToAudioQueue
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AudioQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt AudioCreatedRule.Arn
+          - Sid: EventBridgeToCompletionQueue
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt CompletionQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt TranscribeCompletedRule.Arn
+          - Sid: EventBridgeToDeadLetterQueue
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventDeadLetterQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt AudioCreatedRule.Arn
+                  - !GetAtt TranscribeCompletedRule.Arn
+
+  TranscribeDataRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: transcribe.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub >-
+                  arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/callnotes-*
+      Policies:
+        - PolicyName: CallNotesMedia
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub arn:${AWS::Partition}:s3:::${AudioBucketName}
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/input/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/asr/v1/jobs/*/transcribe.json
+
+  StartTranscriptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: StartCallNotesTranscription
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt AudioQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/audio.m4a
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/source/metadata.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/ready.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/input/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/terminal.json
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/input/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/status.json
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt CompletionQueue.Arn
+              - Effect: Allow
+                Action: transcribe:StartTranscriptionJob
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - transcribe:GetTranscriptionJob
+                  - transcribe:TagResource
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/callnotes-*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt TranscribeDataRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: transcribe.amazonaws.com
+
+  StartTranscriptionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/start_transcription/
+      Handler: app.handler
+      Role: !GetAtt StartTranscriptionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          LANGUAGE_CODE: !Ref LanguageCode
+          TRANSCRIBE_DATA_ROLE_ARN: !GetAtt TranscribeDataRole.Arn
+          COMPLETION_QUEUE_URL: !Ref CompletionQueue
+          EXPECTED_BUCKET_OWNER: !Ref AWS::AccountId
+      Events:
+        AudioQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt AudioQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  StartTranscriptionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${StartTranscriptionFunction}"
+      RetentionInDays: 30
+
+  FinalizeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: FinalizeCallNotes
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: transcribe:GetTranscriptionJob
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:transcribe:${AWS::Region}:${AWS::AccountId}:transcription-job/callnotes-*
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt CompletionQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/audio.m4a
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/ready.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/source/metadata.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/asr/v1/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/llm/v1/jobs/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/asr/v1/jobs/*/transcript.*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/llm/v1/jobs/*
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/status.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/terminal.json
+                  - !Sub >-
+                    arn:${AWS::Partition}:s3:::${AudioBucketName}/call-notes/dt=*/*/pipeline/v1/jobs/*
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub >-
+                  arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${SummaryModelId}
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub >-
+                    arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0
+                  - !Sub >-
+                    arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/amazon.nova-lite-v1:0
+                  - !Sub >-
+                    arn:${AWS::Partition}:bedrock:us-west-1::foundation-model/amazon.nova-lite-v1:0
+                  - !Sub >-
+                    arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/amazon.nova-lite-v1:0
+                Condition:
+                  StringEquals:
+                    bedrock:InferenceProfileArn: !Sub >-
+                      arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${SummaryModelId}
+
+  FinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/finalize/
+      Handler: app.handler
+      Role: !GetAtt FinalizeRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          SUMMARY_MODEL_ID: !Ref SummaryModelId
+          EXPECTED_BUCKET_OWNER: !Ref AWS::AccountId
+      Events:
+        CompletionQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CompletionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  FinalizeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${FinalizeFunction}"
+      RetentionInDays: 30
+
+  AudioDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Call Notes audio jobs reached the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AudioDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - [!Ref AlarmTopicArn]
+        - !Ref AWS::NoValue
+
+  CompletionDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Call Notes finalization reached the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt CompletionDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - [!Ref AlarmTopicArn]
+        - !Ref AWS::NoValue
+
+  EventDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Call Notes EventBridge delivery reached the dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  AudioQueueUrl:
+    Value: !Ref AudioQueue
+  AudioDeadLetterQueueUrl:
+    Value: !Ref AudioDeadLetterQueue
+  CompletionQueueUrl:
+    Value: !Ref CompletionQueue
+  CompletionDeadLetterQueueUrl:
+    Value: !Ref CompletionDeadLetterQueue
+  EventDeadLetterQueueUrl:
+    Value: !Ref EventDeadLetterQueue

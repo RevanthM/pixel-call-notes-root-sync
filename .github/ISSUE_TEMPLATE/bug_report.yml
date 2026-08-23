@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible defect using synthetic or redacted evidence
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never attach call audio, transcripts, summaries, contacts, phone numbers,
+        screenshots, databases, protobufs, device serials, cloud IDs, or credentials.
+        Use GitHub private vulnerability reporting for security defects.
+  - type: input
+    id: component
+    attributes:
+      label: Component
+      placeholder: Android setup, rooted sync, or AWS pipeline
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Non-identifying versions
+      description: Device codename, Android API/build, and component versions; no serial.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic names, timestamps, object keys, and transcript content.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed all private call, device, account, and credential data.
+          required: true
